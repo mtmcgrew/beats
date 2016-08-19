@@ -241,6 +241,9 @@ func (c *Checkpoint) read() (*PersistedState, error) {
 		}
 		return nil, err
 	}
+	if (contents[0] == 0) {
+		return nil, nil
+	}
 
 	ps := &PersistedState{}
 	err = yaml.Unmarshal(contents, ps)

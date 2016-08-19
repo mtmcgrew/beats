@@ -6,6 +6,10 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"archive/zip"
+	"bufio"
+	"time"
+	"sort"
 )
 
 const RotatorMaxFiles = 1024
@@ -93,7 +97,7 @@ func (rotator *FileRotator) FilePath(file_no int) string {
 	if file_no == 0 {
 		return filepath.Join(rotator.Path, rotator.Name)
 	}
-	filename := strings.Join([]string{rotator.Name, strconv.Itoa(file_no)}, ".")
+	filename := strings.Join([]string{rotator.Name, strconv.Itoa(file_no) + ".zip"}, ".")
 	return filepath.Join(rotator.Path, filename)
 }
 
@@ -107,41 +111,66 @@ func (rotator *FileRotator) FileExists(file_no int) bool {
 }
 
 func (rotator *FileRotator) Rotate() error {
-
 	if rotator.current != nil {
 		if err := rotator.current.Close(); err != nil {
 			return err
 		}
 	}
-
-	// delete any extra files, normally we shouldn't have any
-	for file_no := *rotator.KeepFiles; file_no < RotatorMaxFiles; file_no++ {
-		if rotator.FileExists(file_no) {
-			perr := os.Remove(rotator.FilePath(file_no))
-			if perr != nil {
-				return perr
-			}
-		}
-	}
-
-	// shift all files from last to first
-	for fileNo := *rotator.KeepFiles - 1; fileNo >= 0; fileNo-- {
-		if !rotator.FileExists(fileNo) {
-			// file doesn't exist, don't rotate
-			continue
-		}
-		file_path := rotator.FilePath(fileNo)
-
-		if rotator.FileExists(fileNo + 1) {
-			// next file exists, something is strange
-			return fmt.Errorf("File %s exists, when rotating would overwrite it", rotator.FilePath(fileNo+1))
-		}
-
-		err := os.Rename(file_path, rotator.FilePath(fileNo+1))
+	if (rotator.current == nil) {
+		// create the new file
+		file_path := rotator.FilePath(0)
+		current, err := os.Create(file_path)
 		if err != nil {
 			return err
 		}
+		rotator.current = current
+		rotator.current_size = 0
+		return nil
 	}
+
+	// create a new file based on the current timestamp
+	timestamp := strconv.FormatInt(time.Now().UnixNano() / int64(time.Millisecond), 10)
+	file_name := rotator.Name + "-" + timestamp + ".zip" ;
+	zip_file_path := filepath.Join(rotator.Path, file_name)
+	zipFile, cerr := os.Create(zip_file_path)
+	if cerr != nil {
+		return cerr
+	}
+	zipWriter := zip.NewWriter(zipFile)
+	iow, zcerr := zipWriter.Create(rotator.Name)
+	if zcerr != nil {
+		return zcerr
+	}
+
+	// read the current log file and zip it up into the new zip file
+	file, _ := os.Open(rotator.FilePath(0))
+	fileReader := bufio.NewReader(file)
+	blockSize := 512 * 1024 // 512kb
+	bytes := make([]byte, blockSize)
+	for {
+		readedBytes, rerr := fileReader.Read(bytes)
+
+		if rerr != nil {
+			if rerr.Error() == "EOF" {
+				break
+			}
+
+			if rerr.Error() != "EOF" {
+				return rerr
+			}
+		}
+
+		if readedBytes >= blockSize {
+			iow.Write(bytes)
+			continue
+		}
+		iow.Write(bytes[:readedBytes])
+	}
+	errr := zipWriter.Close()
+	if errr != nil {
+		return errr
+	}
+	file.Close()
 
 	// create the new file
 	file_path := rotator.FilePath(0)
@@ -152,9 +181,22 @@ func (rotator *FileRotator) Rotate() error {
 	rotator.current = current
 	rotator.current_size = 0
 
-	// delete the extra file, ignore errors here
-	file_path = rotator.FilePath(*rotator.KeepFiles)
-	os.Remove(file_path)
+	for {
+		// find all files
+		filePathList := []string{}
+		filepath.Walk(rotator.Path, func(path string, f os.FileInfo, err error) error {
+			if (strings.HasSuffix(path, ".zip")) {
+				filePathList = append(filePathList, path)
+			}
+			return nil
+		})
+		if (len(filePathList) < *rotator.KeepFiles) {
+			break
+		} else {
+			sort.Strings(filePathList)
+			os.Remove(filePathList[0])
+		}
+	}
 
 	return nil
 }
